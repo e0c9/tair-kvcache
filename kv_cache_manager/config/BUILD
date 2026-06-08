@@ -1,16 +1,44 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
-    name = "leader_elector_base",
+    name = "leader_elector_interface",
+    hdrs = [
+        "leader_elector_interface.h",
+        "node_endpoint_info.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+    ],
+)
+
+cc_library(
+    name = "raft_leader_elector",
     srcs = [
-        "leader_elector.cc",
+        "raft_leader_elector.cc",
     ],
     hdrs = [
-        "leader_elector.h",
+        "raft_leader_elector.h",
+        "node_endpoint_info.h",
+    ],
+    deps = [
+        ":leader_elector_interface",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/meta/raft:raft_coordinator",
+    ],
+)
+
+cc_library(
+    name = "lease_lock_leader_elector",
+    srcs = [
+        "lease_lock_leader_elector.cc",
+    ],
+    hdrs = [
+        "lease_lock_leader_elector.h",
         "node_endpoint_info.h",
     ],
     deps = [
         ":coordination_backend",
+        ":leader_elector_interface",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:loop_thread",
     ],
@@ -61,7 +89,20 @@ cc_library(
         "//kv_cache_manager/common:concurrent_hash_map",
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/meta/raft:raft_mode",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+    ],
+)
+
+cc_library(
+    name = "registry_raft_backend",
+    srcs = ["registry_raft_backend.cc"],
+    hdrs = ["registry_raft_backend.h"],
+    deps = [
+        ":config",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/meta/raft:raft_coordinator",
+        "//kv_cache_manager/meta/raft:raft_log_codec",
     ],
 )
 

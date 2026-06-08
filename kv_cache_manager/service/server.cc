@@ -7,13 +7,18 @@
 #include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
 #include "kv_cache_manager/config/coordination_backend_factory.h"
-#include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/lease_lock_leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
+#include "kv_cache_manager/config/raft_leader_elector.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/config/registry_raft_backend.h"
+#include "kv_cache_manager/config/registry_storage_backend_factory.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
+#include "kv_cache_manager/meta/meta_storage_backend_factory.h"
+#include "kv_cache_manager/meta/raft/raft_coordinator.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
@@ -42,6 +47,11 @@ bool Server::Init(const ServerConfig &config) {
     }
 
     auto registry_storage_uri = config_.GetRegistryStorageUri();
+    if (config_.IsRaftEnabled()) {
+        RegistryStorageBackendFactory::RegisterType("raft", [] { return std::make_unique<RegistryRaftBackend>(); });
+        MetaStorageBackendFactory::SetRaftModeEnabled(true);
+        registry_storage_uri = "raft://";
+    }
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
     registry_manager_->Init();
 
@@ -62,28 +72,67 @@ bool Server::Init(const ServerConfig &config) {
         cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
 
-    meta_impl_->DisableLeaderOnlyRequests();
-    admin_impl_->DisableLeaderOnlyRequests();
-
     KVCM_LOG_INFO("server init success.");
     return true;
 }
 
 void Server::OnBecomeLeader() {
+    is_leader_.store(true);
     KVCM_LOG_INFO("Server promoted to leader, starting recover...");
+
+    if (config_.IsRaftEnabled() && !is_first_leader_election_) {
+        cache_manager_->ResumeReclaimer();
+        meta_impl_->EnableLeaderOnlyRequests();
+        admin_impl_->EnableLeaderOnlyRequests();
+        KVCM_LOG_INFO("raft mode fast recover end (zero-cost)");
+        return;
+    }
+
+    if (config_.IsRaftEnabled()) {
+        // In raft mode, the first leader election requires startup loading
+        // which performs synchronous raft writes (AppendAndWait). Running
+        // this on the NuRaft callback thread would block heartbeats and
+        // cause re-elections. Dispatch to a background thread.
+        std::thread([this]() { OnBecomeLeaderWork(); }).detach();
+        return;
+    }
+
+    OnBecomeLeaderWork();
+}
+
+void Server::OnBecomeLeaderWork() {
+    if (config_.IsRaftEnabled() && raft_coordinator_) {
+        ErrorCode bec = raft_coordinator_->Barrier();
+        if (bec != EC_OK) {
+            KVCM_LOG_ERROR("raft barrier failed (ec=%d), state machine may be stale", bec);
+            return;
+        }
+    }
+
     ErrorCode ec = registry_manager_->DoRecover();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("registry_manager recover failed");
         return;
     }
 
+    if (!is_leader_.load()) {
+        KVCM_LOG_WARN("lost leadership during recover, aborting");
+        return;
+    }
+
     if (!is_startup_loaded_) {
-        is_startup_loaded_ = true;
         StartupConfigLoader loader;
         loader.Init(registry_manager_);
         if (!loader.Load(config_.startup_config())) {
             KVCM_LOG_ERROR("Startup loader failed");
+        } else {
+            is_startup_loaded_ = true;
         }
+    }
+
+    if (!is_leader_.load()) {
+        KVCM_LOG_WARN("lost leadership during startup load, aborting");
+        return;
     }
 
     ec = cache_manager_->DoRecover();
@@ -95,10 +144,12 @@ void Server::OnBecomeLeader() {
 
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
+    is_first_leader_election_ = false;
     KVCM_LOG_INFO("recover end");
 }
 
 void Server::OnNoLongerLeader() {
+    is_leader_.store(false);
     KVCM_LOG_INFO("Server demoted to standby, starting cleanup...");
     cache_manager_->PauseReclaimer();
 
@@ -107,6 +158,14 @@ void Server::OnNoLongerLeader() {
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+
+    if (config_.IsRaftEnabled()) {
+        // Raft 模式：只清理 write sessions（进行中的写会话不能跨 leader 继续），
+        // MetaIndexer/DataStorage/Registry 内存结构保持不变，state machine 持续 apply。
+        cache_manager_->CleanupWriteSessions();
+        KVCM_LOG_INFO("raft mode lightweight cleanup completed");
+        return;
+    }
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {
@@ -136,6 +195,19 @@ bool Server::Start() {
     if (!leader_elector_->Start()) {
         KVCM_LOG_ERROR("leader_elector start failed");
         return false;
+    }
+    if (config_.IsRaftEnabled() && raft_coordinator_) {
+        ErrorCode rc = raft_coordinator_->Start(raft_cfg_);
+        if (rc != EC_OK) {
+            KVCM_LOG_ERROR("RaftCoordinator Start failed, rc=%d", rc);
+            raft_meta::RaftCoordinator::SetInstance(nullptr);
+            return false;
+        }
+        auto *rm = registry_manager_.get();
+        raft_coordinator_->SetRegistryCommitCallback(
+            [rm](bool is_save, const std::string &key, const std::map<std::string, std::string> &fields) {
+                rm->OnRegistryCommit(is_save, key, fields);
+            });
     }
     KVCM_LOG_INFO("\n%s\nkvcm server start OK!\nversion: %s\ncommit: %s\nbuild time: %s",
                   KVCM_ART,
@@ -306,6 +378,76 @@ void Server::CreateAndRegisterEventPublisher() {
     KVCM_LOG_INFO("create and register event publisher OK");
 }
 bool Server::CreateLeaderElector() {
+    if (config_.IsRaftEnabled()) {
+        return CreateRaftLeaderElector();
+    }
+    return CreateLeaseLockLeaderElector();
+}
+
+bool Server::CreateRaftLeaderElector() {
+    std::string host = config_.GetAdvertisedHost();
+    if (host.empty()) {
+        host = NetUtil::GetLocalIp();
+    }
+    std::string raft_host = config_.GetRaftHost();
+    if (raft_host.empty()) {
+        raft_host = host;
+    }
+
+    std::string node_id = config_.GetLeaderElectorNodeId();
+    if (node_id.empty()) {
+        node_id = raft_host + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" +
+                  StringUtil::GenerateRandomString(16);
+    }
+
+    NodeEndpointInfo node_info(node_id,
+                               host,
+                               config_.GetServiceRpcPort(),
+                               config_.GetServiceHttpPort(),
+                               config_.GetServiceAdminRpcPort(),
+                               config_.GetServiceAdminHttpPort(),
+                               config_.GetCustomInfo());
+
+    // Build RaftCoordinator::Config.
+    raft_meta::RaftCoordinator::Config raft_cfg;
+    raft_cfg.server_id = config_.GetRaftServerId();
+    raft_cfg.port = config_.GetRaftPort();
+    raft_cfg.self_endpoint = raft_host + ":" + std::to_string(raft_cfg.port);
+    raft_cfg.self_aux = node_info.ToJsonString();
+    raft_cfg.data_dir = config_.GetRaftDataDir();
+    raft_cfg.snapshot_distance = config_.GetRaftSnapshotDistance();
+    raft_cfg.election_timeout_lower = config_.GetRaftElectionTimeoutLower();
+    raft_cfg.election_timeout_upper = config_.GetRaftElectionTimeoutUpper();
+    raft_cfg.heart_beat_interval = config_.GetRaftHeartBeatInterval();
+
+    for (const auto &p : config_.GetRaftPeers()) {
+        raft_meta::RaftCoordinator::PeerSpec ps;
+        ps.server_id = p.server_id;
+        ps.endpoint = p.host + ":" + std::to_string(p.port);
+        raft_cfg.peers.push_back(ps);
+    }
+
+    raft_coordinator_ = std::make_shared<raft_meta::RaftCoordinator>();
+    raft_meta::RaftCoordinator::SetInstance(raft_coordinator_.get());
+
+    auto elector = std::make_shared<RaftLeaderElector>(node_id);
+    elector->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
+    elector->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
+
+    if (!elector->Start()) {
+        KVCM_LOG_ERROR("RaftLeaderElector Start failed");
+        raft_meta::RaftCoordinator::SetInstance(nullptr);
+        return false;
+    }
+    elector->SetSelfNodeInfo(node_info);
+
+    raft_cfg_ = raft_cfg;
+    leader_elector_ = elector;
+    KVCM_LOG_INFO("Raft leader elector created, server_id[%d] node_id[%s]", raft_cfg.server_id, node_id.c_str());
+    return true;
+}
+
+bool Server::CreateLeaseLockLeaderElector() {
     auto coordination_uri = config_.GetCoordinationUri();
     std::string node_id = config_.GetLeaderElectorNodeId();
     std::string host = config_.GetAdvertisedHost();
@@ -322,15 +464,14 @@ bool Server::CreateLeaderElector() {
         return false;
     }
 
-    leader_elector_ = std::make_shared<LeaderElector>(coordination_backend_,
-                                                      kLeaderLockKey,
-                                                      node_id,
-                                                      config_.GetLeaderElectorLeaseMs(),
-                                                      config_.GetLeaderElectorLoopIntervalMs());
+    leader_elector_ = std::make_shared<LeaseLockLeaderElector>(coordination_backend_,
+                                                               kLeaderLockKey,
+                                                               node_id,
+                                                               config_.GetLeaderElectorLeaseMs(),
+                                                               config_.GetLeaderElectorLoopIntervalMs());
     leader_elector_->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
     leader_elector_->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
 
-    // 写入本节点的连接信息到协调后端
     {
         NodeEndpointInfo node_info(node_id,
                                    host,
@@ -391,6 +532,12 @@ void Server::Stop() {
         KVCM_LOG_INFO("metrics reporter stopped.");
     }
     KVCM_LOG_INFO("admin http server stopped.");
+    if (raft_coordinator_) {
+        raft_meta::RaftCoordinator::SetInstance(nullptr);
+        raft_coordinator_->Stop();
+        raft_coordinator_.reset();
+        KVCM_LOG_INFO("raft coordinator stopped.");
+    }
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }
 

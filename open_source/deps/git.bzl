@@ -170,6 +170,32 @@ def git_deps():
         build_file = clean_dep("//3rdparty/yaml-cpp:BUILD"),
     )
 
+    # LMDB 0.9.33 — Lightning Memory-Mapped Database, used for persistent raft log store.
+    http_archive(
+        name = "lmdb",
+        sha256 = "9c352fa9bdad53d920128ac6a62296f2850c7e29862a610d3a72f5f49a1cd7ea",
+        strip_prefix = "lmdb-LMDB_0.9.33",
+        type = "tar.gz",
+        urls = [
+            "https://codeload.github.com/LMDB/lmdb/tar.gz/LMDB_0.9.33",
+            "https://github.com/LMDB/lmdb/archive/LMDB_0.9.33.tar.gz",
+        ],
+        build_file = clean_dep("//3rdparty/lmdb:lmdb.BUILD"),
+    )
+
+    # NuRaft v3.0.0 — eBay Raft consensus library, used by phase-1 HA mode.
+    http_archive(
+        name = "nuraft",
+        sha256 = "3f8f51b8357426a92349caf9a79951d2965a953986c33f33cd12637f183195aa",
+        strip_prefix = "NuRaft-0563f31059cae5b45d2cb57576916984d9513630",
+        type = "tar.gz",
+        urls = [
+            "https://codeload.github.com/eBay/NuRaft/tar.gz/0563f31059cae5b45d2cb57576916984d9513630",
+            "https://github.com/eBay/NuRaft/archive/0563f31059cae5b45d2cb57576916984d9513630.tar.gz",
+        ],
+        build_file = clean_dep("//3rdparty/nuraft:nuraft.BUILD"),
+    )
+
     http_archive(
         name = "mooncake",
         sha256 = "eb3f3f53d873d441cbd04cebd76506b56d7526c805da25b8525ed54abc2a06ba",

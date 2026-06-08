@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/meta/raft/raft_coordinator.h"
 #include "kv_cache_manager/service/server_config.h"
 
 namespace grpc {
@@ -12,11 +13,12 @@ class Server;
 }
 
 namespace kv_cache_manager {
+
 class DebugServiceImpl;
 class AdminServiceImpl;
 class MetaServiceImpl;
 class CoordinationBackend;
-class LeaderElector;
+class ILeaderElector;
 class RegistryManager;
 class CacheManager;
 
@@ -46,15 +48,20 @@ private:
     bool StartMetricsReportThread();
     void CreateAndRegisterEventPublisher();
     bool CreateLeaderElector();
+    bool CreateRaftLeaderElector();
+    bool CreateLeaseLockLeaderElector();
 
     void OnBecomeLeader();
+    void OnBecomeLeaderWork(); // heavy recovery logic, runs on background thread in raft mode
     void OnNoLongerLeader();
 
 private:
     const std::string kLeaderLockKey = "_TAIR_KVCM_LEADER_KEY";
 
     std::atomic<bool> stop_{false};
+    std::atomic<bool> is_leader_{false};
     bool is_startup_loaded_ = false;
+    bool is_first_leader_election_ = true;
     ServerConfig config_;
     std::shared_ptr<MetaServiceImpl> meta_impl_;
     std::shared_ptr<AdminServiceImpl> admin_impl_;
@@ -73,7 +80,7 @@ private:
     std::thread debug_http_thread_;
 
     std::shared_ptr<CoordinationBackend> coordination_backend_;
-    std::shared_ptr<LeaderElector> leader_elector_;
+    std::shared_ptr<ILeaderElector> leader_elector_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<CacheManager> cache_manager_;
 
@@ -81,5 +88,8 @@ private:
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LoopThread> metrics_report_thread_;
+
+    std::shared_ptr<raft_meta::RaftCoordinator> raft_coordinator_;
+    raft_meta::RaftCoordinator::Config raft_cfg_;
 };
 } // namespace kv_cache_manager
